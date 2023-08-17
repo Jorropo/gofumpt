@@ -316,14 +316,14 @@ func (f *fumpter) applyPre(c *astutil.Cursor) {
 
 	switch node := c.Node().(type) {
 	case *ast.File:
-		// Join contiguous lone var/const/import lines.
+		// Join contiguous lone import lines.
 		// Abort if there are empty lines in between,
 		// including a leading comment if it's a directive.
 		newDecls := make([]ast.Decl, 0, len(node.Decls))
 		for i := 0; i < len(node.Decls); {
 			newDecls = append(newDecls, node.Decls[i])
 			start, ok := node.Decls[i].(*ast.GenDecl)
-			if !ok || isCgoImport(start) || containsAnyDirective(start.Doc) {
+			if !ok || start.Tok != token.IMPORT || isCgoImport(start) || containsAnyDirective(start.Doc) {
 				i++
 				continue
 			}
@@ -361,6 +361,67 @@ func (f *fumpter) applyPre(c *astutil.Cursor) {
 				}
 				lastPos = cont.Pos()
 				i++
+			}
+		}
+		node.Decls = newDecls
+
+		// Breakup parentised declarations (except imports).
+		newDecls = make([]ast.Decl, 0, len(node.Decls))
+	groupSplitLoop:
+		for _, n := range node.Decls {
+			start, ok := n.(*ast.GenDecl)
+			if !ok || start.Tok == token.IMPORT || start.Lparen == token.NoPos || start.Doc != nil {
+				newDecls = append(newDecls, n)
+				continue
+			}
+
+			beforeRewrite := newDecls // save incase we need to cancel for iota
+			for _, declaration := range start.Specs {
+				if start.Tok == token.CONST {
+					for _, v := range declaration.(*ast.ValueSpec).Values {
+						var hasIota bool
+						ast.Inspect(v, func(n ast.Node) bool {
+							id, ok := n.(*ast.Ident)
+							if !ok {
+								return true
+							}
+
+							if id.Name == "iota" {
+								hasIota = true
+								return false
+							}
+
+							return true
+						})
+						if hasIota {
+							// don't rewrite groups that contains iotas
+							newDecls = append(beforeRewrite, n)
+							continue groupSplitLoop
+						}
+					}
+				}
+
+				var doc *ast.CommentGroup
+				var spec ast.Spec
+				switch v := declaration.(type) {
+				case *ast.ValueSpec:
+					doc = v.Doc
+					a := *v
+					a.Doc = nil
+					spec = &a
+				case *ast.TypeSpec:
+					doc = v.Doc
+					a := *v
+					a.Doc = nil
+					spec = &a
+				}
+
+				newDecls = append(newDecls, &ast.GenDecl{
+					Tok:    start.Tok,
+					TokPos: spec.Pos(),
+					Doc:    doc,
+					Specs:  []ast.Spec{spec},
+				})
 			}
 		}
 		node.Decls = newDecls
